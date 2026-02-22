@@ -40,15 +40,6 @@ DEFAULT_SCORING_CONFIG = {
             .replace({0: 1e-9}).values.astype(float)
         ),
     },
-    "log_time_to_cancel": {
-        "fn": lambda m, b: np.log(
-            eval.time_to_cancel(m)
-            .dt.total_seconds()
-            .replace({0: 1e-9})
-            .values.astype(float)
-        ),
-    },
-
     # VOLUMES:
     "ask_volume_touch": {
         "fn": lambda m, b: eval.l1_volume(m, b).ask_vol.values,
@@ -325,11 +316,13 @@ def run_benchmark(
         last_progress_time = now
 
     def _record_failure(phase: str, stock: str, model_name: str, time_period: str, mv: Any, exc: Exception) -> None:
+        import traceback
         msg = (
             f"[!] {phase} scoring failed for stock={stock}, model={model_name}, "
             f"time_period={time_period}, model_version={mv}: {exc}"
         )
         print(msg)
+        traceback.print_exc()
         errors.append(msg)
 
     for stock in args.stock:
