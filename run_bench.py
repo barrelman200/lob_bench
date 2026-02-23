@@ -40,6 +40,14 @@ DEFAULT_SCORING_CONFIG = {
             .replace({0: 1e-9}).values.astype(float)
         ),
     },
+    "log_time_to_cancel": {
+        "fn": lambda m, b: np.log(
+            eval.time_to_cancel(m)
+            .dt.total_seconds()
+            .replace({0: 1e-9})
+            .values.astype(float)
+        ),
+    },
     # VOLUMES:
     "ask_volume_touch": {
         "fn": lambda m, b: eval.l1_volume(m, b).ask_vol.values,
@@ -276,14 +284,21 @@ def run_benchmark(
     if metric_config is None:
         metric_config = DEFAULT_METRICS
 
-    # Filter scoring config to requested metric subset (for sharded runs).
-    # Only filters unconditional config (also used by divergence mode).
-    # Conditional/contextual/time-lagged have different key namespaces.
+    # Filter scoring configs to requested metric subset (for sharded runs).
+    # Each scoring type has its own key namespace, so we only filter the active type(s).
+    # Divergence uses scoring_config (unconditional namespace).
     metrics_arg = getattr(args, "metrics", None)
     if metrics_arg:
         metric_names = [m.strip() for m in metrics_arg.split(",")]
-        scoring_config = _filter_config(scoring_config, metric_names)
-        print(f"[*] Filtered to {len(scoring_config)} metrics: {list(scoring_config.keys())}")
+        if args.unconditional or args.divergence:
+            scoring_config = _filter_config(scoring_config, metric_names)
+        if args.conditional:
+            scoring_config_cond = _filter_config(scoring_config_cond, metric_names)
+        if args.context:
+            scoring_config_context = _filter_config(scoring_config_context, metric_names)
+        if args.time_lagged:
+            scoring_config_time_lagged = _filter_config(scoring_config_time_lagged, metric_names)
+        print(f"[*] Filtered to metrics: {metric_names}")
 
     if isinstance(args.stock, str):
         args.stock = [args.stock]
