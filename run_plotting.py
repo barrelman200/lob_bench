@@ -54,6 +54,60 @@ def _parse_score_filename(filename: str):
     return score_type, stock, model, timestamp
 
 
+def _gather_score_files(score_dir, reference_dirs, pattern):
+    """Glob score files from score_dir and any reference_dirs, deduplicating by realpath."""
+    files = sorted(glob(f"{score_dir}/{pattern}"))
+    for ref_dir in (reference_dirs or []):
+        files.extend(sorted(glob(f"{ref_dir}/{pattern}")))
+    seen = set()
+    unique = []
+    for f in files:
+        real = os.path.realpath(f)
+        if real not in seen:
+            seen.add(real)
+            unique.append(f)
+    return unique
+
+
+def _get_valid_models(all_scores_uncond, min_metrics=15):
+    """Return set of (stock, model) pairs with enough valid unconditional metrics.
+
+    A metric is 'valid' if at least one of its score values (e.g. wasserstein)
+    has a finite (non-NaN, non-inf) mean.  Models with fewer than *min_metrics*
+    valid metrics are considered incomplete.
+    """
+    valid = set()
+    for stock, models in all_scores_uncond.items():
+        for model, scores in models.items():
+            if not scores:
+                continue
+            n_valid = 0
+            for metric_data in scores.values():
+                if isinstance(metric_data, dict):
+                    has_finite = any(
+                        isinstance(v, (tuple, list)) and len(v) >= 1
+                        and isinstance(v[0], (int, float)) and np.isfinite(v[0])
+                        for v in metric_data.values()
+                    )
+                    if has_finite:
+                        n_valid += 1
+            if n_valid >= min_metrics:
+                valid.add((stock, model))
+    return valid
+
+
+def _filter_score_dicts(valid_models, *score_dicts):
+    """Remove models not in valid_models from all score dicts (in-place)."""
+    dropped = set()
+    for scores_dict in score_dicts:
+        for stock in list(scores_dict.keys()):
+            for model in list(scores_dict[stock].keys()):
+                if (stock, model) not in valid_models:
+                    dropped.add(f"{stock}/{model}")
+                    del scores_dict[stock][model]
+    return sorted(dropped)
+
+
 def _load_all_scores(files):
     all_scores = {}
     all_dfs = {}
@@ -239,11 +293,15 @@ def run_plotting(
 ) -> None:
     # load all saved stats
     print("[*] Loading data...", flush=True)
-    uncond_files = sorted(glob(score_dir + "/scores_uncond_*.pkl"))
-    cond_files = sorted(glob(score_dir + "/scores_cond_*.pkl"))
-    context_files = sorted(glob(score_dir + "/scores_context_*.pkl"))
-    time_lagged_files = sorted(glob(score_dir + "/scores_time_lagged_*.pkl"))
-    div_files = sorted(glob(score_dir + "/scores_div_*.pkl"))
+    ref_dirs = getattr(args, 'reference_dir', None) or []
+    uncond_files = _gather_score_files(score_dir, ref_dirs, "scores_uncond_*.pkl")
+    cond_files = _gather_score_files(score_dir, ref_dirs, "scores_cond_*.pkl")
+    context_files = _gather_score_files(score_dir, ref_dirs, "scores_context_*.pkl")
+    time_lagged_files = _gather_score_files(score_dir, ref_dirs, "scores_time_lagged_*.pkl")
+    skip_div = getattr(args, 'skip_div', False)
+    div_files = [] if skip_div else _gather_score_files(score_dir, ref_dirs, "scores_div_*.pkl")
+    if skip_div:
+        print("[*] Skipping divergence scores (--skip_div)")
     if len(div_files) > 0:
         div_horizon_length = int(div_files[0].split("_")[-3])
 
@@ -271,6 +329,21 @@ def run_plotting(
         all_scores_time_lagged, all_dfs_time_lagged, all_timestamps_time_lagged = _load_all_scores(time_lagged_files)
     if len(div_files) > 0:
         all_scores_div, all_dfs_div, _ = _load_all_scores(div_files)
+
+    # Filter incomplete models (NaN / missing metrics)
+    if getattr(args, 'filter_incomplete', False) and all_scores_uncond:
+        valid_models = _get_valid_models(all_scores_uncond, min_metrics=15)
+        dropped = _filter_score_dicts(
+            valid_models,
+            all_scores_uncond, all_dfs_uncond,
+            all_scores_cond, all_dfs_cond,
+            all_scores_context, all_dfs_context,
+            all_scores_time_lagged, all_dfs_time_lagged,
+            all_scores_div, all_dfs_div,
+        )
+        if dropped:
+            print(f"[*] Filtered {len(dropped)} incomplete model(s): {', '.join(dropped)}")
+        print(f"[*] Keeping {sum(len(m) for m in all_scores_uncond.values())} model(s)")
 
     # Combined summary plots across all score types
     combined_scores = {}
@@ -571,6 +644,12 @@ if __name__ == "__main__":
                         help="Only generate summary plots and skip other plots")
     parser.add_argument("--histograms", action="store_true", default=False,
                         help="Plot histograms of scores")
+    parser.add_argument("--reference_dir", action="append", default=[],
+                        help="Additional score directories to include (repeatable)")
+    parser.add_argument("--filter_incomplete", action="store_true", default=False,
+                        help="Drop models with <15 valid unconditional metrics")
+    parser.add_argument("--skip_div", action="store_true", default=False,
+                        help="Exclude divergence scores from plots (for fair comparison when not all models have div)")
     args = parser.parse_args()
 
     run_plotting(args,args.score_dir, args.plot_dir,args.model_name)

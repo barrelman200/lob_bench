@@ -46,9 +46,12 @@ def _subsample_for_bootstrap(score_df: pd.DataFrame, max_samples: int = None) ->
     if max_samples <= 0 or len(score_df) <= max_samples:
         return score_df
     n_per_type = max_samples // 2
-    sampled = score_df.groupby('type', group_keys=False).apply(
-        lambda g: g.sample(n=min(n_per_type, len(g)), random_state=42)
-    )
+    # pd.concat instead of groupby.apply to avoid pandas 3.0 dropping the
+    # grouping column (breaking change from 2.x where it was preserved).
+    sampled = pd.concat([
+        g.sample(n=min(n_per_type, len(g)), random_state=42)
+        for _, g in score_df.groupby('type')
+    ])
     print(f"[metrics] Bootstrap subsample: {len(score_df)} → {len(sampled)} samples", flush=True)
     return sampled.reset_index(drop=True)
 
