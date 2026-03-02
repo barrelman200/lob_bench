@@ -9,6 +9,14 @@ import statsmodels.api as sm
 import warnings
 import re
 
+# --- Polars auto-detection for fast CSV parsing ---
+_USE_POLARS = False
+try:
+    import polars as pl
+    _USE_POLARS = True
+except ImportError:
+    pass
+
 
 def get_price_range_for_level(
         book: pd.DataFrame,
@@ -56,7 +64,66 @@ def cut_data_to_lvl(in_path, out_path, lvl, overwrite=False):
         m.to_csv(out_path + m_f.rsplit('/', 1)[1], header=None, index=None)
         b.to_csv(out_path + b_f.rsplit('/', 1)[1], header=None, index=None)
 
-def load_message_df(m_f: str, parse_time: bool = True) -> pd.DataFrame:
+def _load_message_df_polars(m_f: str, parse_time: bool = True) -> pd.DataFrame:
+    """Fast CSV parsing via Polars, with pandas boundary for Decimal time."""
+    cols = ['time', 'event_type', 'order_id', 'size', 'price', 'direction']
+    schema = {
+        'time': pl.Utf8,
+        'event_type': pl.Int32,
+        'order_id': pl.Int32,
+        'size': pl.Int32,
+        'price': pl.Int32,
+        'direction': pl.Int32,
+    }
+    try:
+        df_pl = pl.read_csv(
+            m_f,
+            has_header=False,
+            new_columns=cols,
+            schema_overrides=schema,
+            ignore_errors=True,
+            truncate_ragged_lines=True,
+            n_columns=6,
+        )
+    except Exception:
+        return _load_message_df_pandas(m_f, parse_time)
+
+    int_cols = ['event_type', 'order_id', 'size', 'price', 'direction']
+    df_pl = df_pl.drop_nulls(subset=int_cols)
+    # Build pandas from column arrays (avoids pyarrow dependency)
+    messages = pd.DataFrame({c: df_pl[c].to_numpy() for c in df_pl.columns})
+
+    if parse_time:
+        try:
+            messages.time = messages.time.apply(
+                lambda x: Decimal(
+                    re.sub(
+                        r"(\.)(?=.*\.)",
+                        '',
+                        re.sub('[^0-9,.]', '', str(x))
+                    )
+                )
+            )
+        except decimal.InvalidOperation as e:
+            print("error with file ", m_f)
+            print("can't convert times to decimal")
+            print("times:")
+            print(messages.time)
+            raise e
+    return messages
+
+
+def _load_book_df_polars(b_f: str) -> pd.DataFrame:
+    """Fast CSV parsing via Polars for orderbook files."""
+    try:
+        df_pl = pl.read_csv(b_f, has_header=False, ignore_errors=True)
+        return pd.DataFrame({c: df_pl[c].to_numpy() for c in df_pl.columns})
+    except Exception:
+        return _load_book_df_pandas(b_f)
+
+
+def _load_message_df_pandas(m_f: str, parse_time: bool = True) -> pd.DataFrame:
+    """Original pandas CSV parsing path."""
     cols = ['time', 'event_type', 'order_id', 'size', 'price', 'direction']
     messages = pd.read_csv(
         m_f,
@@ -107,13 +174,21 @@ def load_message_df(m_f: str, parse_time: bool = True) -> pd.DataFrame:
             raise e
     return messages
 
+
+def _load_book_df_pandas(b_f: str) -> pd.DataFrame:
+    """Original pandas CSV parsing path."""
+    return pd.read_csv(b_f, index_col=False, header=None)
+
+
+def load_message_df(m_f: str, parse_time: bool = True) -> pd.DataFrame:
+    if _USE_POLARS:
+        return _load_message_df_polars(m_f, parse_time)
+    return _load_message_df_pandas(m_f, parse_time)
+
 def load_book_df(b_f: str) -> pd.DataFrame:
-    book = pd.read_csv(
-        b_f,
-        index_col=False,
-        header=None
-    )
-    return book
+    # Polars is slower than pandas for wide CSVs (500 cols orderbook),
+    # so always use pandas for book loading.
+    return _load_book_df_pandas(b_f)
 
 def add_date_to_time(df: pd.DataFrame, date: str) -> pd.Series:
     # df.time = pd.to_datetime(date) + pd.to_datetime(df.time, unit='s')

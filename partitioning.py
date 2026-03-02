@@ -8,6 +8,14 @@ import numpy as np
 import pandas as pd
 import data_loading
 
+# --- Polars auto-detection for fast DataFrame construction ---
+_USE_POLARS = False
+try:
+    import polars as pl
+    _USE_POLARS = True
+except ImportError:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Worker-pool configuration (set via set_n_workers before scoring calls)
@@ -362,6 +370,66 @@ def group_by_subseq(
     ]
     return groups_real, groups_gen
 
+
+def _get_score_table_polars(
+        scores_real: Optional[Iterable],
+        scores_gen: Optional[Iterable[Iterable]],
+        groups_real: Optional[Iterable],
+        groups_gen: Optional[Iterable[Iterable]],
+    ) -> pd.DataFrame:
+    """Fast score table construction via pre-flattened numpy arrays + Polars."""
+    score_parts = []
+    group_parts = []
+    type_parts = []
+
+    # REAL DATA
+    if scores_real is not None:
+        if hasattr(scores_real[0], '__iter__'):
+            for scores_i, groups_i in zip(scores_real, groups_real):
+                s = np.asarray(scores_i, dtype=np.float64).ravel()
+                g = np.asarray(groups_i).ravel()
+                score_parts.append(s)
+                group_parts.append(g)
+                type_parts.append(np.full(len(s), 'real', dtype=object))
+        else:
+            s = np.asarray(scores_real, dtype=np.float64).ravel()
+            g = np.asarray(groups_real).ravel()
+            score_parts.append(s)
+            group_parts.append(g)
+            type_parts.append(np.full(len(s), 'real', dtype=object))
+
+    # GENERATED DATA
+    if scores_gen is not None:
+        if hasattr(scores_gen[0][0], '__iter__'):
+            for scores_i, groups_i in zip(scores_gen, groups_gen):
+                for scores_ij, groups_ij in zip(scores_i, groups_i):
+                    s = np.asarray(scores_ij, dtype=np.float64).ravel()
+                    g = np.asarray(groups_ij).ravel()
+                    score_parts.append(s)
+                    group_parts.append(g)
+                    type_parts.append(np.full(len(s), 'generated', dtype=object))
+        else:
+            for scores_i, groups_i in zip(scores_gen, groups_gen):
+                s = np.asarray(scores_i, dtype=np.float64).ravel()
+                g = np.asarray(groups_i).ravel()
+                score_parts.append(s)
+                group_parts.append(g)
+                type_parts.append(np.full(len(s), 'generated', dtype=object))
+
+    if not score_parts:
+        return pd.DataFrame(columns=['score', 'group', 'type'])
+
+    all_scores = np.concatenate(score_parts)
+    all_groups = np.concatenate(group_parts)
+    all_types = np.concatenate(type_parts)
+
+    return pd.DataFrame({
+        'score': all_scores,
+        'group': all_groups,
+        'type': all_types,
+    })
+
+
 def get_score_table(
         scores_real: Optional[Iterable],
         scores_gen: Optional[Iterable[Iterable]],
@@ -375,6 +443,9 @@ def get_score_table(
         groups_real = scores_real
     if (groups_gen is None):
         groups_gen = scores_gen
+
+    if _USE_POLARS:
+        return _get_score_table_polars(scores_real, scores_gen, groups_real, groups_gen)
 
     # REAL DATA
     if scores_real is not None:

@@ -29,6 +29,16 @@ try:
 except ImportError:
     pass
 
+# --- Numba auto-detection for CPU-accelerated bootstrap ---
+_USE_NUMBA = False
+try:
+    import numba
+    from numba import njit
+    _USE_NUMBA = True
+    print(f"[metrics] Numba available — version: {numba.__version__}")
+except ImportError:
+    pass
+
 # --- Bootstrap subsampling for large score_dfs ---
 _MAX_BOOTSTRAP_SAMPLES = int(os.environ.get('BENCH_MAX_BOOTSTRAP_SAMPLES', '50000'))
 
@@ -354,6 +364,199 @@ def _bootstrap_l1(
     return ci, losses
 
 
+# --- Numba JIT bootstrap implementations ---
+# Defined conditionally so the module loads cleanly without numba.
+
+if _USE_NUMBA:
+    @njit(cache=True)
+    def _numba_bootstrap_l1_kernel(real_groups, gen_groups, real_idx, gen_idx, n_bins):
+        """L1 bootstrap kernel: bincount + normalize + abs-diff-sum."""
+        n_bootstrap = real_idx.shape[0]
+        losses = np.empty(n_bootstrap, dtype=np.float64)
+        for b in range(n_bootstrap):
+            r_counts = np.zeros(n_bins, dtype=np.float64)
+            g_counts = np.zeros(n_bins, dtype=np.float64)
+            for j in range(real_idx.shape[1]):
+                r_counts[real_groups[real_idx[b, j]]] += 1.0
+            for j in range(gen_idx.shape[1]):
+                g_counts[gen_groups[gen_idx[b, j]]] += 1.0
+            r_sum = r_counts.sum()
+            g_sum = g_counts.sum()
+            if r_sum > 0:
+                for k in range(n_bins):
+                    r_counts[k] /= r_sum
+            if g_sum > 0:
+                for k in range(n_bins):
+                    g_counts[k] /= g_sum
+            total = 0.0
+            for k in range(n_bins):
+                total += abs(r_counts[k] - g_counts[k])
+            losses[b] = total / 2.0
+        return losses
+
+    @njit(cache=True)
+    def _numba_bootstrap_wasserstein_kernel(real_scores, gen_scores, real_idx, gen_idx):
+        """Wasserstein bootstrap kernel: sort-based 1D earth mover's distance."""
+        n_bootstrap = real_idx.shape[0]
+        n_real = real_idx.shape[1]
+        n_gen = gen_idx.shape[1]
+        losses = np.empty(n_bootstrap, dtype=np.float64)
+        if n_real == n_gen:
+            # Equal-size: Wasserstein = mean |sorted_r - sorted_g|
+            for b in range(n_bootstrap):
+                r = np.empty(n_real, dtype=np.float64)
+                g = np.empty(n_gen, dtype=np.float64)
+                for j in range(n_real):
+                    r[j] = real_scores[real_idx[b, j]]
+                for j in range(n_gen):
+                    g[j] = gen_scores[gen_idx[b, j]]
+                r.sort()
+                g.sort()
+                total = 0.0
+                for j in range(n_real):
+                    total += abs(r[j] - g[j])
+                losses[b] = total / n_real
+        else:
+            # Unequal-size: quantile-grid approach (matches JAX path)
+            n_grid = max(n_real, n_gen)
+            for b in range(n_bootstrap):
+                r = np.empty(n_real, dtype=np.float64)
+                g = np.empty(n_gen, dtype=np.float64)
+                for j in range(n_real):
+                    r[j] = real_scores[real_idx[b, j]]
+                for j in range(n_gen):
+                    g[j] = gen_scores[gen_idx[b, j]]
+                r.sort()
+                g.sort()
+                total = 0.0
+                for k in range(n_grid):
+                    frac = (k + 0.5) / n_grid
+                    ri = int(frac * n_real)
+                    if ri >= n_real:
+                        ri = n_real - 1
+                    gi = int(frac * n_gen)
+                    if gi >= n_gen:
+                        gi = n_gen - 1
+                    total += abs(r[ri] - g[gi])
+                losses[b] = total / n_grid
+        return losses
+
+    @njit(cache=True)
+    def _numba_bootstrap_ks_kernel(real_scores, gen_scores, real_idx, gen_idx):
+        """KS bootstrap kernel: merge-scan of sorted CDFs, track max |CDF_r - CDF_g|."""
+        n_bootstrap = real_idx.shape[0]
+        n_real = real_idx.shape[1]
+        n_gen = gen_idx.shape[1]
+        losses = np.empty(n_bootstrap, dtype=np.float64)
+        for b in range(n_bootstrap):
+            r = np.empty(n_real, dtype=np.float64)
+            g = np.empty(n_gen, dtype=np.float64)
+            for j in range(n_real):
+                r[j] = real_scores[real_idx[b, j]]
+            for j in range(n_gen):
+                g[j] = gen_scores[gen_idx[b, j]]
+            r.sort()
+            g.sort()
+            # Merge-scan: walk both sorted arrays simultaneously
+            max_diff = 0.0
+            i_r = 0
+            i_g = 0
+            while i_r < n_real and i_g < n_gen:
+                if r[i_r] <= g[i_g]:
+                    i_r += 1
+                else:
+                    i_g += 1
+                cdf_r = i_r / n_real
+                cdf_g = i_g / n_gen
+                diff = abs(cdf_r - cdf_g)
+                if diff > max_diff:
+                    max_diff = diff
+            # Drain remaining elements
+            while i_r < n_real:
+                i_r += 1
+                cdf_r = i_r / n_real
+                cdf_g = i_g / n_gen
+                diff = abs(cdf_r - cdf_g)
+                if diff > max_diff:
+                    max_diff = diff
+            while i_g < n_gen:
+                i_g += 1
+                cdf_r = i_r / n_real
+                cdf_g = i_g / n_gen
+                diff = abs(cdf_r - cdf_g)
+                if diff > max_diff:
+                    max_diff = diff
+            losses[b] = max_diff
+        return losses
+
+
+def _bootstrap_wasserstein_numba(
+    score_df: pd.DataFrame,
+    n_bootstrap: int = 100,
+    ci_alpha: float = 0.01,
+    whole_data_loss: float = None,
+    rng_np: np.random.Generator = np.random.default_rng(12345),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Numba-accelerated Wasserstein bootstrap."""
+    real_scores = score_df.loc[score_df['type'] == 'real', 'score'].values.astype(np.float64)
+    gen_scores = score_df.loc[score_df['type'] == 'generated', 'score'].values.astype(np.float64)
+    n_real, n_gen = len(real_scores), len(gen_scores)
+    real_idx = rng_np.integers(0, n_real, size=(n_bootstrap, n_real))
+    gen_idx = rng_np.integers(0, n_gen, size=(n_bootstrap, n_gen))
+    losses = _numba_bootstrap_wasserstein_kernel(real_scores, gen_scores, real_idx, gen_idx)
+    if whole_data_loss is not None:
+        losses = np.concatenate([[whole_data_loss], losses])
+    q = np.array([ci_alpha / 2 * 100, 100 - ci_alpha / 2 * 100])
+    ci = np.percentile(losses, q=q)
+    return ci, losses
+
+
+def _bootstrap_ks_numba(
+    score_df: pd.DataFrame,
+    n_bootstrap: int = 100,
+    ci_alpha: float = 0.01,
+    whole_data_loss: float = None,
+    rng_np: np.random.Generator = np.random.default_rng(12345),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Numba-accelerated KS bootstrap."""
+    real_scores = score_df.loc[score_df['type'] == 'real', 'score'].values.astype(np.float64)
+    gen_scores = score_df.loc[score_df['type'] == 'generated', 'score'].values.astype(np.float64)
+    n_real, n_gen = len(real_scores), len(gen_scores)
+    real_idx = rng_np.integers(0, n_real, size=(n_bootstrap, n_real))
+    gen_idx = rng_np.integers(0, n_gen, size=(n_bootstrap, n_gen))
+    losses = _numba_bootstrap_ks_kernel(real_scores, gen_scores, real_idx, gen_idx)
+    if whole_data_loss is not None:
+        losses = np.concatenate([[whole_data_loss], losses])
+    q = np.array([ci_alpha / 2 * 100, 100 - ci_alpha / 2 * 100])
+    ci = np.percentile(losses, q=q)
+    return ci, losses
+
+
+def _bootstrap_l1_numba(
+    score_df: pd.DataFrame,
+    n_bootstrap: int = 100,
+    ci_alpha: float = 0.01,
+    whole_data_loss: float = None,
+    rng_np: np.random.Generator = np.random.default_rng(12345),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Numba-accelerated L1 bootstrap."""
+    type_vals = score_df['type'].values
+    real_mask = type_vals == 'real'
+    groups = score_df['group'].values
+    real_groups = groups[real_mask].astype(np.intp)
+    gen_groups = groups[~real_mask].astype(np.intp)
+    n_real, n_gen = len(real_groups), len(gen_groups)
+    n_bins = int(max(real_groups.max(), gen_groups.max())) + 1 if (n_real > 0 and n_gen > 0) else 1
+    real_idx = rng_np.integers(0, n_real, size=(n_bootstrap, n_real))
+    gen_idx = rng_np.integers(0, n_gen, size=(n_bootstrap, n_gen))
+    losses = _numba_bootstrap_l1_kernel(real_groups, gen_groups, real_idx, gen_idx, n_bins)
+    if whole_data_loss is not None:
+        losses = np.concatenate([[whole_data_loss], losses])
+    q = np.array([ci_alpha / 2 * 100, 100 - ci_alpha / 2 * 100])
+    ci = np.percentile(losses, q=q)
+    return ci, losses
+
+
 def wasserstein(
     score_df: pd.DataFrame,
     bootstrap_ci: bool = True,
@@ -389,11 +592,17 @@ def wasserstein(
                     print(f"[metrics] JAX OOM in wasserstein, falling back to numpy "
                           f"({len(boot_df)} samples)", flush=True)
                     rng_np.bit_generator.state = rng_state
-                    ci, losses = _bootstrap_wasserstein(boot_df, n_bootstrap, ci_alpha, w, rng_np)
+                    if _USE_NUMBA:
+                        ci, losses = _bootstrap_wasserstein_numba(boot_df, n_bootstrap, ci_alpha, w, rng_np)
+                    else:
+                        ci, losses = _bootstrap_wasserstein(boot_df, n_bootstrap, ci_alpha, w, rng_np)
                 else:
                     raise
         else:
-            ci, losses = _bootstrap_wasserstein(boot_df, n_bootstrap, ci_alpha, w, rng_np)
+            if _USE_NUMBA:
+                ci, losses = _bootstrap_wasserstein_numba(boot_df, n_bootstrap, ci_alpha, w, rng_np)
+            else:
+                ci, losses = _bootstrap_wasserstein(boot_df, n_bootstrap, ci_alpha, w, rng_np)
         return w, ci, losses
     else:
         return w
@@ -432,11 +641,17 @@ def ks_distance(
                     print(f"[metrics] JAX OOM in ks_distance, falling back to numpy "
                           f"({len(boot_df)} samples)", flush=True)
                     rng_np.bit_generator.state = rng_state
-                    ci, losses = _bootstrap_ks(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
+                    if _USE_NUMBA:
+                        ci, losses = _bootstrap_ks_numba(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
+                    else:
+                        ci, losses = _bootstrap_ks(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
                 else:
                     raise
         else:
-            ci, losses = _bootstrap_ks(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
+            if _USE_NUMBA:
+                ci, losses = _bootstrap_ks_numba(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
+            else:
+                ci, losses = _bootstrap_ks(boot_df, n_bootstrap, ci_alpha, ks, rng_np)
         return ks, ci, losses
     else:
         return ks
@@ -485,11 +700,17 @@ def l1_by_group(
                     print(f"[metrics] JAX OOM in l1_by_group, falling back to numpy "
                           f"({len(boot_df)} samples)", flush=True)
                     rng_np.bit_generator.state = rng_state
-                    l1_ci, l1s = _bootstrap_l1(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
+                    if _USE_NUMBA:
+                        l1_ci, l1s = _bootstrap_l1_numba(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
+                    else:
+                        l1_ci, l1s = _bootstrap_l1(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
                 else:
                     raise
         else:
-            l1_ci, l1s = _bootstrap_l1(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
+            if _USE_NUMBA:
+                l1_ci, l1s = _bootstrap_l1_numba(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
+            else:
+                l1_ci, l1s = _bootstrap_l1(boot_df, n_bootstrap, ci_alpha, l1, rng_np)
         return l1, l1_ci, l1s
     else:
         return l1
