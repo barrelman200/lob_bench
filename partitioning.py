@@ -412,11 +412,22 @@ def _get_score_table_polars(
         if hasattr(scores_gen[0][0], '__iter__'):
             for scores_i, groups_i in zip(scores_gen, groups_gen):
                 for scores_ij, groups_ij in zip(scores_i, groups_i):
-                    s = _to_flat(scores_ij)
-                    g = _to_flat(groups_ij, dtype=None)
-                    score_parts.append(s)
-                    group_parts.append(g)
-                    type_parts.append(np.full(len(s), 'generated', dtype=object))
+                    if isinstance(scores_ij, (tuple, list)):
+                        # Triple-nested (divergence): scores_ij is a tuple
+                        # of arrays, groups_ij is arange — broadcast group
+                        # index to match each score array's length
+                        for sg_arr, g_idx in zip(scores_ij, groups_ij):
+                            s = _to_flat(sg_arr)
+                            score_parts.append(s)
+                            group_parts.append(np.full(len(s), g_idx))
+                            type_parts.append(np.full(len(s), 'generated', dtype=object))
+                    else:
+                        # Double-nested (regular): both are 1-D arrays
+                        s = _to_flat(scores_ij)
+                        g = _to_flat(groups_ij, dtype=None)
+                        score_parts.append(s)
+                        group_parts.append(g)
+                        type_parts.append(np.full(len(s), 'generated', dtype=object))
         else:
             for scores_i, groups_i in zip(scores_gen, groups_gen):
                 s = _to_flat(scores_i)
