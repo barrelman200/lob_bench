@@ -371,6 +371,15 @@ def group_by_subseq(
     return groups_real, groups_gen
 
 
+def _to_flat(data, dtype=np.float64):
+    """Convert potentially ragged nested data to a flat 1-D array."""
+    try:
+        return np.asarray(data, dtype=dtype).ravel()
+    except ValueError:
+        return np.concatenate([np.atleast_1d(np.asarray(x, dtype=dtype)).ravel()
+                               for x in data])
+
+
 def _get_score_table_polars(
         scores_real: Optional[Iterable],
         scores_gen: Optional[Iterable[Iterable]],
@@ -386,14 +395,14 @@ def _get_score_table_polars(
     if scores_real is not None:
         if hasattr(scores_real[0], '__iter__'):
             for scores_i, groups_i in zip(scores_real, groups_real):
-                s = np.asarray(scores_i, dtype=np.float64).ravel()
-                g = np.asarray(groups_i).ravel()
+                s = _to_flat(scores_i)
+                g = _to_flat(groups_i, dtype=None)
                 score_parts.append(s)
                 group_parts.append(g)
                 type_parts.append(np.full(len(s), 'real', dtype=object))
         else:
-            s = np.asarray(scores_real, dtype=np.float64).ravel()
-            g = np.asarray(groups_real).ravel()
+            s = _to_flat(scores_real)
+            g = _to_flat(groups_real, dtype=None)
             score_parts.append(s)
             group_parts.append(g)
             type_parts.append(np.full(len(s), 'real', dtype=object))
@@ -403,15 +412,15 @@ def _get_score_table_polars(
         if hasattr(scores_gen[0][0], '__iter__'):
             for scores_i, groups_i in zip(scores_gen, groups_gen):
                 for scores_ij, groups_ij in zip(scores_i, groups_i):
-                    s = np.asarray(scores_ij, dtype=np.float64).ravel()
-                    g = np.asarray(groups_ij).ravel()
+                    s = _to_flat(scores_ij)
+                    g = _to_flat(groups_ij, dtype=None)
                     score_parts.append(s)
                     group_parts.append(g)
                     type_parts.append(np.full(len(s), 'generated', dtype=object))
         else:
             for scores_i, groups_i in zip(scores_gen, groups_gen):
-                s = np.asarray(scores_i, dtype=np.float64).ravel()
-                g = np.asarray(groups_i).ravel()
+                s = _to_flat(scores_i)
+                g = _to_flat(groups_i, dtype=None)
                 score_parts.append(s)
                 group_parts.append(g)
                 type_parts.append(np.full(len(s), 'generated', dtype=object))
