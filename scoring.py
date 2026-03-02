@@ -10,6 +10,43 @@ import partitioning
 import data_loading
 
 
+def _run_metrics_threaded(metric_fn, score_df):
+    """Run distance functions (L1, wasserstein, KS) in parallel with threads.
+
+    Numba @njit kernels release the GIL, so the bootstrap loops run
+    concurrently.  Falls back to serial when there is only one metric.
+    """
+    if len(metric_fn) <= 1:
+        return {m_name: m(score_df) for m_name, m in metric_fn.items()}
+    with ThreadPoolExecutor(max_workers=len(metric_fn)) as pool:
+        futures = {
+            pool.submit(m, score_df): m_name
+            for m_name, m in metric_fn.items()
+        }
+        return {futures[f]: f.result() for f in as_completed(futures)}
+
+
+def _stack_metrics_threaded(metric_fn, score_df):
+    """Run distance functions in parallel and return stacked bootstrap losses.
+
+    Like _run_metrics_threaded but returns np.stack([losses_0, losses_1, ...], axis=-1)
+    matching the pattern used in conditional / context / time-lagged scoring.
+    Preserves metric_fn iteration order.
+    """
+    if len(metric_fn) <= 1:
+        return np.stack(
+            tuple(mfn(score_df)[2] for mfn in metric_fn.values()), axis=-1
+        )
+    names = list(metric_fn.keys())
+    fns = list(metric_fn.values())
+    with ThreadPoolExecutor(max_workers=len(fns)) as pool:
+        futures = {pool.submit(fn, score_df): i for i, fn in enumerate(fns)}
+        results = [None] * len(fns)
+        for f in as_completed(futures):
+            results[futures[f]] = f.result()[2]
+    return np.stack(results, axis=-1)
+
+
 def get_kwargs(score_config, conditional=False):
     kwargs = {
         "discrete": score_config.get("discrete", False),
@@ -483,12 +520,7 @@ def compute_metrics_context(
     losses = []
     for regime_id, regime_df in score_df.groupby('group'):
         lens.append(len(regime_df))
-        losses.append(
-            np.stack(
-                tuple(mfn(regime_df)[2] for mfn in metric_fn.values()),
-                axis=-1
-            )
-        )
+        losses.append(_stack_metrics_threaded(metric_fn, regime_df))
     
     # Calculate weights by normalizing the number of observations
     weights = np.array(lens, dtype=float)
@@ -608,12 +640,7 @@ def compute_metrics_time_lagged(
         lens.append(len(group))
         # use the subgroup for binning now:
         group.group = group.subgroup
-        losses.append(
-            np.stack(
-                tuple(mfn(group)[2] for mfn in metric_fn.values()),
-                axis=-1
-            )
-        )
+        losses.append(_stack_metrics_threaded(metric_fn, group))
 
     # calculate weights by normalizing the number of observations
     weights = np.array(lens, dtype=float)
@@ -654,7 +681,7 @@ def compute_metrics(
     if scoring_fn_cond is None:
         score_df, plot_fn = score_data(
             loader, scoring_fn, return_plot_fn=True, **score_kwargs)
-        metric = {m_name: m(score_df) for m_name, m in metric_fn.items()}
+        metric = _run_metrics_threaded(metric_fn, score_df)
 
     # conditional scoring
     else:
@@ -667,43 +694,30 @@ def compute_metrics(
         # calc. loss for each of the conditional distributions
         lens = []
         losses = []
-        # len_and_losses = []
         for name, group in score_df.groupby('group'):
-            # len_and_losses.append([len(group), metric_fn(group)[0]])
             lens.append(len(group))
             # use the subgroup for binning now:
             group.group = group.subgroup
-            losses.append(
-                np.stack(
-                    tuple(mfn(group)[2] for mfn in metric_fn.values()),
-                    axis=-1
-                )
-            )
+            losses.append(_stack_metrics_threaded(metric_fn, group))
 
         # calculate weights by normalizing the number of observations
         weights = np.array(lens, dtype=float)
         weights /= weights.sum()
         losses = np.array(losses).T
-        # print('weights:', weights, 'losses:', losses.shape, losses)
         # sum over all groups
         # shape: (num metrics, n_bootstrap + 1, num groups)
         #     -> (num metrics, n_bootstrap + 1)
         metric = np.nansum(losses * weights, axis=-1)
-        # print('metric:', metric)
 
         # get the percentiles of the bootstrapped loss values
-        # TODO: make this an argument
         ci_alpha = 0.01
         q = np.array([ci_alpha/2 * 100, 100 - ci_alpha/2*100])
         # shape: (num metrics, n_bootstrap + 1)
         ci = np.nanpercentile(metric, q, axis=-1).T
-        # print('ci', ci)
-        # metric = (metric[:, 0], ci, metric)
         metric = {
             m_name: (m[0], ci_, m) for m_name, ci_, m
                 in zip(metric_fn.keys(), ci, metric)
         }
-        # print('metric:', metric)
 
     return metric, score_df, plot_fn
 
@@ -761,10 +775,21 @@ def compute_divergence_metrics(
 
     if isinstance(metric_fn, dict):
         # Per-metric divergence curves: {name: [(point, ci, losses), ...per horizon]}
-        loss_horizons = {
-            m_name: [m(sdf) for sdf in score_dfs_horizon]
-            for m_name, m in metric_fn.items()
-        }
+        # Run distance functions in parallel across threads
+        if len(metric_fn) > 1:
+            def _div_one(m):
+                return [m(sdf) for sdf in score_dfs_horizon]
+            with ThreadPoolExecutor(max_workers=len(metric_fn)) as pool:
+                futures = {
+                    pool.submit(_div_one, m): m_name
+                    for m_name, m in metric_fn.items()
+                }
+                loss_horizons = {futures[f]: f.result() for f in as_completed(futures)}
+        else:
+            loss_horizons = {
+                m_name: [m(sdf) for sdf in score_dfs_horizon]
+                for m_name, m in metric_fn.items()
+            }
         # Plot uses first metric (consistent with compute_metrics pattern)
         first_key = next(iter(loss_horizons))
         plot_fn = lambda title, ax, _lh=loss_horizons[first_key]: \
