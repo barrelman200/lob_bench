@@ -189,19 +189,19 @@ def time_to_first_fill(messages: pd.DataFrame) -> pd.Series:
     Hence, the actual time to fill is underestimated.
     """
     # filter for new orders and executions
-    orders = messages[(messages.event_type == 1) | (messages.event_type == 4)]
+    orders = messages[messages.event_type.isin({1, 4})]
 
     # filter order to only include messages related to new orders
-    new_ids = orders[orders.event_type == 1].order_id.unique()
+    new_ids = orders.loc[orders.event_type == 1, 'order_id'].unique()
     orders = orders[orders.order_id.isin(new_ids)]
 
-    del_t = orders.groupby('order_id').apply(
-        # take new order (type 1) and first execution (type 4) if it exists
-        # and calculate time difference
-        lambda x: x.iloc[:2].time.diff().iloc[-1],
-        include_groups = False
-    # get rid of nans from orders that were not executed
-    ).dropna()
+    # Vectorized: time of new order (first event) and first fill (second event)
+    rank = orders.groupby('order_id').cumcount()
+    t_new = orders.loc[rank == 0, ['order_id', 'time']].set_index('order_id')['time']
+    t_fill = orders.loc[rank == 1, ['order_id', 'time']].set_index('order_id')['time']
+
+    # Orders with no fill have no rank-1 entry → dropped by dropna
+    del_t = (t_fill - t_new).dropna()
     return del_t
 
 def time_to_cancel(messages: pd.DataFrame) -> pd.Series:
@@ -211,23 +211,19 @@ def time_to_cancel(messages: pd.DataFrame) -> pd.Series:
     CAVE: only orders which are cancelled are considered. Open orders and executions are ignored.
     """
     # filter for new orders, cancellations, modifications
-    orders = messages[
-        (messages.event_type == 1) |
-        (messages.event_type == 2) |
-        (messages.event_type == 3)
-    ]
+    orders = messages[messages.event_type.isin({1, 2, 3})]
 
     # filter order to only include messages related to new orders
-    new_ids = orders[orders.event_type == 1].order_id.unique()
+    new_ids = orders.loc[orders.event_type == 1, 'order_id'].unique()
     orders = orders[orders.order_id.isin(new_ids)]
 
-    del_t = orders.groupby('order_id').apply(
-        # take new order (type 1) and first cancellation (type 2 or 3) if it exists
-        # and calculate time difference
-        lambda x: x.iloc[:2].time.diff().iloc[-1],
-        include_groups=False
-    # get rid of nans from orders that were not cancelled
-    ).dropna()
+    # Vectorized: time of new order (first event) and first cancel/modify (second event)
+    rank = orders.groupby('order_id').cumcount()
+    t_new = orders.loc[rank == 0, ['order_id', 'time']].set_index('order_id')['time']
+    t_cancel = orders.loc[rank == 1, ['order_id', 'time']].set_index('order_id')['time']
+
+    # Orders with no cancel have no rank-1 entry → dropped by dropna
+    del_t = (t_cancel - t_new).dropna()
     # always return a Series with a timedelta type
     if len(del_t) == 0:
         return pd.to_timedelta(pd.Series())
